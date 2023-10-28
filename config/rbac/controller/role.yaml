@@ -1,0 +1,48 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: controller-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ptrk.io
+  resources:
+  - scwexternalips
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ptrk.io
+  resources:
+  - scwexternalips/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - ptrk.io
+  resources:
+  - scwexternalips/status
+  verbs:
+  - get
+  - patch
+  - update

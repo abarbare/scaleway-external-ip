@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- ptrk.io_v1alpha1_scwexternalip.yaml
+#+kubebuilder:scaffold:manifestskustomizesamples

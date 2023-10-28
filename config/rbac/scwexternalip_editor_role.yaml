@@ -1,0 +1,31 @@
+# permissions for end users to edit scwexternalips.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: clusterrole
+    app.kubernetes.io/instance: scwexternalip-editor-role
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/created-by: scaleway-external-ip
+    app.kubernetes.io/part-of: scaleway-external-ip
+    app.kubernetes.io/managed-by: kustomize
+  name: scwexternalip-editor-role
+rules:
+- apiGroups:
+  - ptrk.io
+  resources:
+  - scwexternalips
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ptrk.io
+  resources:
+  - scwexternalips/status
+  verbs:
+  - get

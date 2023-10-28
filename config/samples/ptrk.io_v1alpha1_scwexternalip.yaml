@@ -1,0 +1,12 @@
+apiVersion: ptrk.io/v1alpha1
+kind: ScwExternalIP
+metadata:
+  labels:
+    app.kubernetes.io/name: scwexternalip
+    app.kubernetes.io/instance: scwexternalip-sample
+    app.kubernetes.io/part-of: scaleway-external-ip
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/created-by: scaleway-external-ip
+  name: scwexternalip-sample
+spec:
+  # TODO(user): Add fields here
