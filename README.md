@@ -59,6 +59,15 @@ TODO: or add a new CRD to manage IP addresses on the nodes, and check every X fo
 
 ## Getting Started
 
+### Warning
+
+Currently, Kubernetes Kapsule does not support IP mobility. There is a [workaround to manually migrate your nodes](https://www.scaleway.com/en/docs/compute/instances/api-cli/using-routed-ips/) which can be used.
+However, all your nodes needs to be migrated (with a reboot), and every new node added automatically will need to be migrated too.
+
+As usual, please don't do this on your production :) 
+
+### Setup
+
 You’ll need a Scaleway Kapsule Kubernetes cluster to run against (could work with a selfhosted cluster on Scaleway instances, though I haven't tested it) running Cilium as CNI.
 
 Install the controller and the agent with:
