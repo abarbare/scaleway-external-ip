@@ -23,8 +23,11 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/patrickmn/go-cache"
 	"github.com/scaleway/scaleway-sdk-go/api/instance/v1"
 	"github.com/scaleway/scaleway-sdk-go/scw"
 	corev1 "k8s.io/api/core/v1"
@@ -54,9 +57,19 @@ var (
 	finalizer    = "ptrk.io/finalizer"
 )
 
+const (
+	cacheKey string = "scwIpCache"
+)
+
 type NodeNameID struct {
-	Name string
-	ID   string
+	Name   string
+	ID     string
+	eipIDs []string
+}
+
+type Cache interface {
+	Set(cacheKey string, value interface{}, maxAge time.Duration)
+	Get(cacheKey string) (value interface{}, found bool)
 }
 
 // ScwExternalIPReconciler reconciles a ScwExternalIP object
@@ -64,6 +77,7 @@ type ScwExternalIPReconciler struct {
 	client.Client
 	Scheme    *runtime.Scheme
 	ScwClient *scw.Client
+	Cache     Cache
 }
 
 //+kubebuilder:rbac:groups=ptrk.io,resources=scwexternalips,verbs=get;list;watch;create;update;patch;delete
@@ -180,17 +194,24 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				continue
 			}
 
+			// Sort the possibleNodes to make sure to spread IPs to all the nodes
+			sort.Slice(possibleNodes, func(i, j int) bool {
+				return len(possibleNodes[i].eipIDs) < len(possibleNodes[j].eipIDs)
+			})
+
 			var nodeName, nodeID string
 
 			if ip.Server != nil {
+				// IP already attached to a server
 				for _, nni := range possibleNodes {
-					if ip.Server.Name == nni.Name {
+					if slices.Contains(nni.eipIDs, ip.ID) {
 						nodeName = nni.Name
 						nodeID = nni.ID
 						break
 					}
 				}
 				if nodeName == "" {
+					// IP not attached to a possible node
 					node := &corev1.Node{}
 					err := r.Get(ctx, types.NamespacedName{Name: ip.Server.Name}, node)
 					if client.IgnoreNotFound(err) != nil {
@@ -275,6 +296,7 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 					})
 				}
 			} else {
+				// IP not attached to a server
 				for i, s := range possibleNodes {
 					_, err = api.UpdateIP(&instance.UpdateIPRequest{
 						// TODO: add reverse ?
@@ -334,12 +356,10 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 func (r *ScwExternalIPReconciler) getInstanceIPMap() (map[string]*instance.IP, error) {
-	api := instance.NewAPI(r.ScwClient)
+
 	ipMap := make(map[string]*instance.IP)
 
-	// TODO: fix this quickwin for the region, or at least document
-	// TODO cache IPs
-	resp, err := api.ListIPs(&instance.ListIPsRequest{}, scw.WithZones(scw.Region(os.Getenv("SCW_REGION")).GetZones()...), scw.WithAllPages())
+	resp, err := r.getCachedAPIResponse()
 	if err != nil {
 		return nil, fmt.Errorf("unable to list scw ips: %w", err)
 	}
@@ -353,6 +373,23 @@ func (r *ScwExternalIPReconciler) getInstanceIPMap() (map[string]*instance.IP, e
 	}
 
 	return ipMap, nil
+}
+
+// getCachedAPIResponse returns the cached API response if available, otherwise it fetches from the API.
+func (r *ScwExternalIPReconciler) getCachedAPIResponse() (*instance.ListIPsResponse, error) {
+	if cachedResponse, found := r.Cache.Get(cacheKey); found {
+		return cachedResponse.(*instance.ListIPsResponse), nil
+	}
+
+	api := instance.NewAPI(r.ScwClient)
+	// TODO: fix this quickwin for the region, or at least document
+	res, err := api.ListIPs(&instance.ListIPsRequest{}, scw.WithZones(scw.Region(os.Getenv("SCW_REGION")).GetZones()...), scw.WithAllPages())
+	if err != nil {
+		return nil, err
+	}
+
+	r.Cache.Set(cacheKey, res, cache.DefaultExpiration)
+	return res, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -533,8 +570,12 @@ func (r *ScwExternalIPReconciler) findNodes(ctx context.Context, zone string, no
 		}
 
 		for _, s := range resp.Servers {
+			eipIDs := make([]string, len(s.PublicIPs))
+			for _, ip := range s.PublicIPs {
+				eipIDs = append(eipIDs, ip.ID)
+			}
 			if slices.Contains(nodeNames, s.Name) {
-				nodeNamesIDs = append(nodeNamesIDs, NodeNameID{Name: s.Name, ID: s.ID})
+				nodeNamesIDs = append(nodeNamesIDs, NodeNameID{Name: s.Name, ID: s.ID, eipIDs: eipIDs})
 			}
 		}
 	}
