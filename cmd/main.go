@@ -19,9 +19,11 @@ package main
 import (
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	"github.com/patrickmn/go-cache"
 	"github.com/scaleway/scaleway-sdk-go/scw"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
@@ -117,6 +119,7 @@ func main() {
 			Client:    mgr.GetClient(),
 			Scheme:    mgr.GetScheme(),
 			ScwClient: scwClient,
+			Cache:     *cache.New(5*time.Second, time.Minute),
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "ScwExternalIP")
 			os.Exit(1)
