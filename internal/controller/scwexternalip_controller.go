@@ -52,9 +52,10 @@ import (
 )
 
 var (
-	serviceField = ".spec.service"
-	zoneLabel    = ".metadata.labels." + corev1.LabelTopologyZone
-	finalizer    = "ptrk.io/finalizer"
+	serviceField        = ".spec.service"
+	zoneLabel           = ".metadata.labels." + corev1.LabelTopologyZone
+	controllerFinalizer = "ptrk.io/controllerFinalizer"
+	agentFinalizer      = "ptrk.io/agentFinalizer"
 )
 
 const (
@@ -62,9 +63,9 @@ const (
 )
 
 type NodeNameID struct {
-	Name   string
-	ID     string
-	eipIDs []string
+	Name  string
+	ID    string
+	specs instance.Server
 }
 
 type Cache interface {
@@ -99,26 +100,31 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// It's deleted!
 	if !scweip.ObjectMeta.DeletionTimestamp.IsZero() {
-		if controllerutil.ContainsFinalizer(&scweip, finalizer) {
+		if controllerutil.ContainsFinalizer(&scweip, controllerFinalizer) {
+			log.Info("externalIP deleted, dettach from compute...")
 			err := r.cleanup(ctx, scweip.Status.AttachedIPs)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
 
-			scweip.Status.AttachedIPs = []ptrkiov1alpha1.ScwExternalIPStatusAttachedIP{}
+			// Cleanup CRD object
+			scweip.Status.DeletingIPs = scweip.Status.AttachedIPs
+			scweip.Status.AttachedIPs = []ptrkiov1alpha1.ScwNodeExternalIP{}
 			scweip.Status.IPs = []string{}
 			scweip.Status.PendingIPsCount = 0
 			scweip.Status.PendingIPs = []ptrkiov1alpha1.ScwExternalIPStatusPendingIP{}
 
-			controllerutil.RemoveFinalizer(&scweip, finalizer)
+			// Cleanup finalizer
+			controllerutil.RemoveFinalizer(&scweip, controllerFinalizer)
 			if err := r.Update(ctx, &scweip); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
 		return ctrl.Result{}, nil
 	} else {
-		if !controllerutil.ContainsFinalizer(&scweip, finalizer) {
-			controllerutil.AddFinalizer(&scweip, finalizer)
+		if !controllerutil.ContainsFinalizer(&scweip, controllerFinalizer) && !controllerutil.ContainsFinalizer(&scweip, agentFinalizer) {
+			controllerutil.AddFinalizer(&scweip, controllerFinalizer)
+			controllerutil.AddFinalizer(&scweip, agentFinalizer)
 			if err := r.Update(ctx, &scweip); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -140,7 +146,7 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	if len(eIPs) == 0 && len(scweip.Status.AttachedIPs) == 0 {
 		// nothing to do
-		scweip.Status.AttachedIPs = []ptrkiov1alpha1.ScwExternalIPStatusAttachedIP{}
+		scweip.Status.AttachedIPs = []ptrkiov1alpha1.ScwNodeExternalIP{}
 		scweip.Status.PendingIPs = []ptrkiov1alpha1.ScwExternalIPStatusPendingIP{}
 		scweip.Status.IPs = []string{}
 		scweip.Status.PendingIPsCount = 0
@@ -155,12 +161,12 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	oldAttached := make(map[string]ptrkiov1alpha1.ScwExternalIPStatusAttachedIP)
+	oldAttached := make(map[string]ptrkiov1alpha1.ScwNodeExternalIP)
 	for _, oip := range scweip.Status.AttachedIPs {
 		oldAttached[oip.IP] = oip
 	}
 
-	scweip.Status.AttachedIPs = []ptrkiov1alpha1.ScwExternalIPStatusAttachedIP{}
+	scweip.Status.AttachedIPs = []ptrkiov1alpha1.ScwNodeExternalIP{}
 	scweip.Status.PendingIPs = []ptrkiov1alpha1.ScwExternalIPStatusPendingIP{}
 	scweip.Status.IPs = []string{}
 	scweip.Status.PendingIPsCount = 0
@@ -196,17 +202,18 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 			// Sort the possibleNodes to make sure to spread IPs to all the nodes
 			sort.Slice(possibleNodes, func(i, j int) bool {
-				return len(possibleNodes[i].eipIDs) < len(possibleNodes[j].eipIDs)
+				return len(possibleNodes[i].specs.PublicIPs) < len(possibleNodes[j].specs.PublicIPs)
 			})
 
-			var nodeName, nodeID string
+			var nodeName, nodeID, nodeMacAddr string
 
 			if ip.Server != nil {
 				// IP already attached to a server
 				for _, nni := range possibleNodes {
-					if slices.Contains(nni.eipIDs, ip.ID) {
+					if nni.Name == ip.Server.Name {
 						nodeName = nni.Name
 						nodeID = nni.ID
+						nodeMacAddr = nni.specs.MacAddress
 						break
 					}
 				}
@@ -263,14 +270,15 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 										continue
 									}
 									scweip.Status.IPs = append(scweip.Status.IPs, eip)
-									scweip.Status.AttachedIPs = append(scweip.Status.AttachedIPs, ptrkiov1alpha1.ScwExternalIPStatusAttachedIP{
-										IP:     eip,
-										IPID:   ip.ID,
-										Zone:   ip.Zone.String(),
-										Node:   s.ID,
-										NodeID: s.Name,
+									scweip.Status.AttachedIPs = append(scweip.Status.AttachedIPs, ptrkiov1alpha1.ScwNodeExternalIP{
+										IP:          eip,
+										IPID:        ip.ID,
+										Zone:        ip.Zone.String(),
+										Node:        s.ID,
+										NodeID:      s.Name,
+										NodeMacAddr: s.specs.MacAddress,
 									})
-									log.Info("Attached IP", "ip", eip, "nodeID", s.ID, "node", s.Name, "zone", ip.Zone.String())
+									log.Info("Attached IP", "ip", eip, "nodeID", s.ID, "node", s.Name, "zone", ip.Zone.String(), "mac", s.specs.MacAddress)
 									break
 								}
 							} else {
@@ -287,12 +295,13 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 					}
 				} else {
 					scweip.Status.IPs = append(scweip.Status.IPs, eip)
-					scweip.Status.AttachedIPs = append(scweip.Status.AttachedIPs, ptrkiov1alpha1.ScwExternalIPStatusAttachedIP{
-						IP:     eip,
-						IPID:   ip.ID,
-						Zone:   ip.Zone.String(),
-						Node:   nodeName,
-						NodeID: nodeID,
+					scweip.Status.AttachedIPs = append(scweip.Status.AttachedIPs, ptrkiov1alpha1.ScwNodeExternalIP{
+						IP:          eip,
+						IPID:        ip.ID,
+						Zone:        ip.Zone.String(),
+						Node:        nodeName,
+						NodeID:      nodeID,
+						NodeMacAddr: nodeMacAddr,
 					})
 				}
 			} else {
@@ -318,14 +327,15 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 						continue
 					}
 					scweip.Status.IPs = append(scweip.Status.IPs, eip)
-					scweip.Status.AttachedIPs = append(scweip.Status.AttachedIPs, ptrkiov1alpha1.ScwExternalIPStatusAttachedIP{
-						IP:     eip,
-						IPID:   ip.ID,
-						Zone:   ip.Zone.String(),
-						Node:   s.ID,
-						NodeID: s.Name,
+					scweip.Status.AttachedIPs = append(scweip.Status.AttachedIPs, ptrkiov1alpha1.ScwNodeExternalIP{
+						IP:          eip,
+						IPID:        ip.ID,
+						Zone:        ip.Zone.String(),
+						Node:        s.ID,
+						NodeID:      s.Name,
+						NodeMacAddr: s.specs.MacAddress,
 					})
-					log.Info("Attached IP", "ip", eip, "nodeID", s.ID, "node", s.Name, "zone", ip.Zone.String())
+					log.Info("Attached IP", "ip", eip, "nodeID", s.ID, "node", s.Name, "zone", ip.Zone.String(), "macAddr", s.specs.MacAddress)
 					break
 				}
 			}
@@ -338,12 +348,12 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	oldAttachedArray := []ptrkiov1alpha1.ScwExternalIPStatusAttachedIP{}
+	scweip.Status.DeletingIPs = []ptrkiov1alpha1.ScwNodeExternalIP{}
 	for _, oip := range oldAttached {
-		oldAttachedArray = append(oldAttachedArray, oip)
+		scweip.Status.DeletingIPs = append(scweip.Status.DeletingIPs, oip)
 	}
 
-	err = r.cleanup(ctx, oldAttachedArray)
+	err = r.cleanup(ctx, scweip.Status.DeletingIPs)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to cleanup old ips: %w", err)
 	}
@@ -570,12 +580,8 @@ func (r *ScwExternalIPReconciler) findNodes(ctx context.Context, zone string, no
 		}
 
 		for _, s := range resp.Servers {
-			eipIDs := make([]string, len(s.PublicIPs))
-			for _, ip := range s.PublicIPs {
-				eipIDs = append(eipIDs, ip.ID)
-			}
 			if slices.Contains(nodeNames, s.Name) {
-				nodeNamesIDs = append(nodeNamesIDs, NodeNameID{Name: s.Name, ID: s.ID, eipIDs: eipIDs})
+				nodeNamesIDs = append(nodeNamesIDs, NodeNameID{Name: s.Name, ID: s.ID, specs: *s})
 			}
 		}
 	}
@@ -583,7 +589,7 @@ func (r *ScwExternalIPReconciler) findNodes(ctx context.Context, zone string, no
 	return nodeNamesIDs, nil
 }
 
-func (r *ScwExternalIPReconciler) cleanup(ctx context.Context, attached []ptrkiov1alpha1.ScwExternalIPStatusAttachedIP) error {
+func (r *ScwExternalIPReconciler) cleanup(ctx context.Context, attached []ptrkiov1alpha1.ScwNodeExternalIP) error {
 	log := log.FromContext(ctx)
 	errs := []string{}
 	api := instance.NewAPI(r.ScwClient)
@@ -611,7 +617,7 @@ func (r *ScwExternalIPReconciler) cleanup(ctx context.Context, attached []ptrkio
 				errs = append(errs, err.Error())
 				continue
 			}
-			log.Info("Detached IP", "ip", ip.IPID, "zone", ip.Zone)
+			log.Info("Detached IP", "ip", ip.IPID, "zone", ip.Zone, "macAddr", ip.NodeMacAddr)
 		}
 	}
 

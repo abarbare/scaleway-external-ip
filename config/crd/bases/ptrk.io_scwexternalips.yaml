@@ -60,8 +60,8 @@ spec:
             properties:
               attachedIPs:
                 items:
-                  description: ScwExternalIPStatusAttachedIP defines the status of
-                    one attached IP
+                  description: ScwNodeExternalIP defines the status of one attached
+                    IP
                   properties:
                     ip:
                       description: IP represents an attached routed IP
@@ -76,6 +76,36 @@ spec:
                     nodeID:
                       description: NodeID is the scw ID of the node on which the IP
                         is attached
+                      type: string
+                    nodeMacAddr:
+                      description: NodeMac is the MAC address of the virtual interface
+                      type: string
+                    zone:
+                      description: Zone is the zone in which the IP exists
+                      type: string
+                  type: object
+                type: array
+              deletingIPs:
+                items:
+                  description: ScwNodeExternalIP defines the status of one attached
+                    IP
+                  properties:
+                    ip:
+                      description: IP represents an attached routed IP
+                      type: string
+                    ipID:
+                      description: IPID represents an attached routed IP's ID
+                      type: string
+                    node:
+                      description: Node is the name of the node on which the IP is
+                        attached
+                      type: string
+                    nodeID:
+                      description: NodeID is the scw ID of the node on which the IP
+                        is attached
+                      type: string
+                    nodeMacAddr:
+                      description: NodeMac is the MAC address of the virtual interface
                       type: string
                     zone:
                       description: Zone is the zone in which the IP exists

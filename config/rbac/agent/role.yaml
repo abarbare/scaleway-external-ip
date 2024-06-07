@@ -19,7 +19,15 @@ rules:
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
+- apiGroups:
+  - ptrk.io
+  resources:
+  - scwexternalips/finalizers
+  verbs:
+  - update
 - apiGroups:
   - ptrk.io
   resources:

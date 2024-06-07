@@ -20,8 +20,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// ScwExternalIPStatusAttachedIP defines the status of one attached IP
-type ScwExternalIPStatusAttachedIP struct {
+// ScwNodeExternalIP defines the status of one attached IP
+type ScwNodeExternalIP struct {
 	// IP represents an attached routed IP
 	IP string `json:"ip,omitempty"`
 	// IPID represents an attached routed IP's ID
@@ -32,6 +32,8 @@ type ScwExternalIPStatusAttachedIP struct {
 	Node string `json:"node,omitempty"`
 	// NodeID is the scw ID of the node on which the IP is attached
 	NodeID string `json:"nodeID,omitempty"`
+	//NodeMac is the MAC address of the virtual interface
+	NodeMacAddr string `json:"nodeMacAddr,omitempty"`
 }
 
 // ScwExternalIPStatusPendingIP defines the status of one pending IP
@@ -58,8 +60,9 @@ type ScwExternalIPSpec struct {
 
 // ScwExternalIPStatus defines the observed state of ScwExternalIP
 type ScwExternalIPStatus struct {
-	AttachedIPs []ScwExternalIPStatusAttachedIP `json:"attachedIPs,omitempty"`
-	PendingIPs  []ScwExternalIPStatusPendingIP  `json:"pendingIPs,omitempty"`
+	AttachedIPs []ScwNodeExternalIP            `json:"attachedIPs,omitempty"`
+	DeletingIPs []ScwNodeExternalIP            `json:"deletingIPs,omitempty"`
+	PendingIPs  []ScwExternalIPStatusPendingIP `json:"pendingIPs,omitempty"`
 	// Are these really useful though, juste to have some sugar around kubectl
 	IPs             []string `json:"ips,omitempty"`
 	PendingIPsCount uint     `json:"pendingIPsCount,omitempty"`

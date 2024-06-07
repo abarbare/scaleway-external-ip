@@ -23,6 +23,7 @@ import (
 	"net/netip"
 
 	"github.com/pkg/errors"
+	"github.com/vishvananda/netlink"
 )
 
 func CommonPrefix(list []string) string {
@@ -49,6 +50,18 @@ func CommonPrefix(list []string) string {
 
 	}
 	return k
+}
+
+func GetNetlinkAddr(ip string) (*netlink.Addr, error) {
+	mask := "/32"
+	parsedIP, err := netip.ParseAddr(ip)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing ip %s: %w", ip, err)
+	}
+	if parsedIP.Is6() {
+		mask = "/64"
+	}
+	return netlink.ParseAddr(ip + mask)
 }
 
 func GetV4OrV664Prefix(ip string) (string, error) {
