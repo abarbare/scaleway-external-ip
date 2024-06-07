@@ -64,7 +64,7 @@ const (
 type NodeNameID struct {
 	Name   string
 	ID     string
-	EIpIds []string
+	eipIDs []string
 }
 
 type Cache interface {
@@ -196,7 +196,7 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 			// Sort the possibleNodes to make sure to spread IPs to all the nodes
 			sort.Slice(possibleNodes, func(i, j int) bool {
-				return len(possibleNodes[i].EIpIds) < len(possibleNodes[j].EIpIds)
+				return len(possibleNodes[i].eipIDs) < len(possibleNodes[j].eipIDs)
 			})
 
 			var nodeName, nodeID string
@@ -204,7 +204,7 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			if ip.Server != nil {
 				// IP already attached to a server
 				for _, nni := range possibleNodes {
-					if slices.Contains(nni.EIpIds, ip.ID) {
+					if slices.Contains(nni.eipIDs, ip.ID) {
 						nodeName = nni.Name
 						nodeID = nni.ID
 						break
@@ -570,12 +570,12 @@ func (r *ScwExternalIPReconciler) findNodes(ctx context.Context, zone string, no
 		}
 
 		for _, s := range resp.Servers {
-			eIpIds := make([]string, len(s.PublicIPs))
+			eipIDs := make([]string, len(s.PublicIPs))
 			for _, ip := range s.PublicIPs {
-				eIpIds = append(eIpIds, ip.ID)
+				eipIDs = append(eipIDs, ip.ID)
 			}
 			if slices.Contains(nodeNames, s.Name) {
-				nodeNamesIDs = append(nodeNamesIDs, NodeNameID{Name: s.Name, ID: s.ID, EIpIds: eIpIds})
+				nodeNamesIDs = append(nodeNamesIDs, NodeNameID{Name: s.Name, ID: s.ID, eipIDs: eipIDs})
 			}
 		}
 	}
