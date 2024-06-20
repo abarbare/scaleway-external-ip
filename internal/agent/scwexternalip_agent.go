@@ -61,26 +61,29 @@ type ScwExternalIPAgent struct {
 func (r *ScwExternalIPAgent) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
+	log.Info("Reconciliation loop")
+
 	var scweips ptrkiov1alpha1.ScwExternalIPList
 	if err := r.List(ctx, &scweips); err != nil {
 		return ctrl.Result{}, fmt.Errorf("could not list scwexternalips: %w", err)
 	}
 
-	for _, scweip := range scweips.Items {
+	for _, eip := range scweips.Items {
+		log.Info("Start", "name", eip.GetName())
 		// It's deleted!
-		if !scweip.ObjectMeta.DeletionTimestamp.IsZero() {
-			if controllerutil.ContainsFinalizer(&scweip, agentFinalizer) {
+		if !eip.ObjectMeta.DeletionTimestamp.IsZero() {
+			if controllerutil.ContainsFinalizer(&eip, agentFinalizer) {
 				log.Info("externalIP deleted, perform umount...")
-				err := r.cleanup(ctx, scweip.Status.AttachedIPs)
+				err := r.cleanup(ctx, eip.Status.AttachedIPs)
 				if err != nil {
 					return ctrl.Result{}, err
 				}
 
 				// Clean CRD object
-				scweip.Status.DeletingIPs = []ptrkiov1alpha1.ScwNodeExternalIP{}
+				eip.Status.DeletingIPs = []ptrkiov1alpha1.ScwNodeExternalIP{}
 
-				controllerutil.RemoveFinalizer(&scweip, agentFinalizer)
-				if err := r.Update(ctx, &scweip); err != nil {
+				controllerutil.RemoveFinalizer(&eip, agentFinalizer)
+				if err := r.Update(ctx, &eip); err != nil {
 					return ctrl.Result{}, err
 				}
 			}
@@ -94,16 +97,25 @@ func (r *ScwExternalIPAgent) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	for _, eip := range scweips.Items {
+		log.Info("Start", "name", eip.GetName())
 		// Add Required IPs
 		addActions, err := r.getLinkAction(ctx, node, eip.Status.AttachedIPs)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("could not get ip actions: %w", err)
 		}
+		log.Info("Add Action", "len", len(addActions))
 		for _, op := range addActions {
 			err = netlink.AddrAdd(op.Link, op.IP)
 			if err != nil && !strings.Contains(err.Error(), "file exists") {
 				log.Error(err, "error adding ip", "ip", op.IP.String())
 				continue
+			}
+			if op.Link.Attrs().Flags&net.FlagUp == 0 {
+				err = netlink.LinkSetUp(op.Link)
+				if err != nil {
+					log.Error(err, "error swithching interface up", "ip", op.IP.String(), "interface", op.Link.Attrs().Name)
+					continue
+				}
 			}
 		}
 
@@ -112,6 +124,7 @@ func (r *ScwExternalIPAgent) Reconcile(ctx context.Context, req ctrl.Request) (c
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("could not get ip actions: %w", err)
 		}
+		log.Info("Del Action", "len", len(addActions))
 		for _, op := range delActions {
 			err = netlink.AddrDel(op.Link, op.IP)
 			if err != nil && !strings.Contains(err.Error(), "file exists") {
@@ -127,17 +140,18 @@ func (r *ScwExternalIPAgent) getLinkAction(ctx context.Context, node corev1.Node
 	log := log.FromContext(ctx)
 	res := []linkAction{}
 
-	m, err := utils.GetMetadata()
-	if err != nil {
-		return res, fmt.Errorf("could not get instance metadata: %w", err)
-	}
+	// m, err := utils.GetMetadata()
+	// if err != nil {
+	// 	return res, fmt.Errorf("could not get instance metadata: %w", err)
+	// }
 
 	for _, ip := range externalIPs {
 		if node.Labels[corev1.LabelTopologyZone] != ip.Zone {
+			log.V(2).Info("Skip node as zone do not match")
 			continue
 		}
 
-		iface, err := getLinkByMacAddr(ip.NodeMacAddr)
+		iface, err := r.getLinkByMacAddr(ctx, ip.NodeMacAddr)
 		if err != nil {
 			if err != noInterfaceError {
 				return res, fmt.Errorf("could not get iface: %w", err)
@@ -145,38 +159,38 @@ func (r *ScwExternalIPAgent) getLinkAction(ctx context.Context, node corev1.Node
 			continue
 		}
 
-		if len(m.PublicIPsV6) > 0 {
-			// TODO have a better idea
-			v6gw := net.ParseIP(m.PublicIPsV6[0].Gateway)
-			// we currently need to add a default route for v6, if it doens't exists
-			v6Routes, err := netlink.RouteList(iface, netlink.FAMILY_V6)
-			if err != nil {
-				return res, fmt.Errorf("could not list ipv6 routes: %w", err)
-			}
+		// if len(m.PublicIPsV6) > 0 {
+		// 	// TODO have a better idea
+		// 	v6gw := net.ParseIP(m.PublicIPsV6[0].Gateway)
+		// 	// we currently need to add a default route for v6, if it doens't exists
+		// 	v6Routes, err := netlink.RouteList(iface, netlink.FAMILY_V6)
+		// 	if err != nil {
+		// 		return res, fmt.Errorf("could not list ipv6 routes: %w", err)
+		// 	}
 
-			gotV6DefaultRoute := false
-			for _, route := range v6Routes {
-				if route.Dst == nil {
-					// TODO: maybe check if it is the good one ?
-					gotV6DefaultRoute = true
-					break
-				}
-			}
+		// 	gotV6DefaultRoute := false
+		// 	for _, route := range v6Routes {
+		// 		if route.Dst == nil {
+		// 			// TODO: maybe check if it is the good one ?
+		// 			gotV6DefaultRoute = true
+		// 			break
+		// 		}
+		// 	}
 
-			if !gotV6DefaultRoute {
-				err = netlink.RouteAdd(&netlink.Route{
-					Dst:       nil,
-					LinkIndex: iface.Attrs().Index,
-					Protocol:  netlink.FAMILY_V6,
-					Gw:        v6gw,
-				})
-				if err != nil {
-					return res, fmt.Errorf("could not add default ipv6 route: %w", err)
-				}
-			}
-		}
+		// 	if !gotV6DefaultRoute {
+		// 		err = netlink.RouteAdd(&netlink.Route{
+		// 			Dst:       nil,
+		// 			LinkIndex: iface.Attrs().Index,
+		// 			Protocol:  netlink.FAMILY_V6,
+		// 			Gw:        v6gw,
+		// 		})
+		// 		if err != nil {
+		// 			return res, fmt.Errorf("could not add default ipv6 route: %w", err)
+		// 		}
+		// 	}
+		// }
 
-		add, err := utils.GetNetlinkAddr(ip.IP)
+		add, err := utils.GetNetlinkAddr(ip)
 		if err != nil {
 			log.Error(err, "error getting netlink address", "ip", ip.IP)
 			continue
@@ -193,7 +207,7 @@ func (r *ScwExternalIPAgent) cleanup(ctx context.Context, attached []ptrkiov1alp
 	errs := []string{}
 	for _, ip := range attached {
 		log.Info("ip to be cleaned", "ip", ip.IP, "mac", ip.NodeMacAddr)
-		iface, err := getLinkByMacAddr(ip.NodeMacAddr)
+		iface, err := r.getLinkByMacAddr(ctx, ip.NodeMacAddr)
 		if err != nil && err != noInterfaceError {
 			return err
 		}
@@ -201,7 +215,7 @@ func (r *ScwExternalIPAgent) cleanup(ctx context.Context, attached []ptrkiov1alp
 			return nil
 		}
 
-		add, err := utils.GetNetlinkAddr(ip.IP)
+		add, err := utils.GetNetlinkAddr(ip)
 		if err != nil {
 			log.Error(err, "error getting netlink address", "ip", ip.IP)
 			continue
@@ -225,7 +239,8 @@ func (r *ScwExternalIPAgent) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func getLinkByMacAddr(macAddr string) (netlink.Link, error) {
+func (r *ScwExternalIPAgent) getLinkByMacAddr(ctx context.Context, macAddr string) (netlink.Link, error) {
+	log := log.FromContext(ctx)
 	hwAddr, err := net.ParseMAC(macAddr)
 	if err != nil {
 		return nil, fmt.Errorf("could not parse mac addr: %w", err)
@@ -241,5 +256,6 @@ func getLinkByMacAddr(macAddr string) (netlink.Link, error) {
 			return link, nil
 		}
 	}
+	log.V(2).Info("No interface found", "macAddr", macAddr)
 	return nil, noInterfaceError
 }

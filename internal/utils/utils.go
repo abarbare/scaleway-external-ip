@@ -24,6 +24,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/vishvananda/netlink"
+	ptrkiov1alpha1 "ptrk.io/scaleway-external-ip/api/v1alpha1"
 )
 
 func CommonPrefix(list []string) string {
@@ -52,16 +53,19 @@ func CommonPrefix(list []string) string {
 	return k
 }
 
-func GetNetlinkAddr(ip string) (*netlink.Addr, error) {
+func GetNetlinkAddr(ip ptrkiov1alpha1.ScwNodeExternalIP) (*netlink.Addr, error) {
 	mask := "/32"
-	parsedIP, err := netip.ParseAddr(ip)
+	if ip.PrivateNetworkId != nil {
+		mask = "/22"
+	}
+	parsedIP, err := netip.ParseAddr(ip.IP)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing ip %s: %w", ip, err)
+		return nil, fmt.Errorf("error parsing ip %s: %w", ip.IP, err)
 	}
 	if parsedIP.Is6() {
 		mask = "/64"
 	}
-	return netlink.ParseAddr(ip + mask)
+	return netlink.ParseAddr(ip.IP + mask)
 }
 
 func GetV4OrV664Prefix(ip string) (string, error) {

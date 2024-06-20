@@ -49,6 +49,10 @@ spec:
                   type: string
                 description: NodeSelector selects on which nodes the IPs will be attached
                 type: object
+              privateNetwork:
+                description: Private Network is the id of the private network where
+                  the IP have to be mounted
+                type: string
               service:
                 description: Service is the name of the targeted Kubernetes service,
                   which contains the scaleway routed IPs
@@ -80,6 +84,10 @@ spec:
                     nodeMacAddr:
                       description: NodeMac is the MAC address of the virtual interface
                       type: string
+                    privateNetworkId:
+                      description: PrivateNetworkId is the ID of the PN where the
+                        IP is attached to
+                      type: string
                     zone:
                       description: Zone is the zone in which the IP exists
                       type: string
@@ -106,6 +114,10 @@ spec:
                       type: string
                     nodeMacAddr:
                       description: NodeMac is the MAC address of the virtual interface
+                      type: string
+                    privateNetworkId:
+                      description: PrivateNetworkId is the ID of the PN where the
+                        IP is attached to
                       type: string
                     zone:
                       description: Zone is the zone in which the IP exists

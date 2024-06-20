@@ -34,6 +34,8 @@ type ScwNodeExternalIP struct {
 	NodeID string `json:"nodeID,omitempty"`
 	//NodeMac is the MAC address of the virtual interface
 	NodeMacAddr string `json:"nodeMacAddr,omitempty"`
+	//PrivateNetworkId is the ID of the PN where the IP is attached to
+	PrivateNetworkId *string `json:"privateNetworkId,omitempty"`
 }
 
 // ScwExternalIPStatusPendingIP defines the status of one pending IP
@@ -56,6 +58,9 @@ type ScwExternalIPSpec struct {
 
 	// NodeSelector selects on which nodes the IPs will be attached
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Private Network is the id of the private network where the IP have to be mounted
+	PrivateNetwork string `json:"privateNetwork,omitempty"`
 }
 
 // ScwExternalIPStatus defines the observed state of ScwExternalIP

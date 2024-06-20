@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -47,6 +48,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/scaleway/scaleway-sdk-go/api/ipam/v1"
 	ptrkiov1alpha1 "ptrk.io/scaleway-external-ip/api/v1alpha1"
 	"ptrk.io/scaleway-external-ip/internal/utils"
 )
@@ -56,10 +58,12 @@ var (
 	zoneLabel           = ".metadata.labels." + corev1.LabelTopologyZone
 	controllerFinalizer = "ptrk.io/controllerFinalizer"
 	agentFinalizer      = "ptrk.io/agentFinalizer"
+	notValidIpamId      = errors.New("not a valid IPAM ID")
 )
 
 const (
-	cacheKey string = "scwIpCache"
+	computeApiCacheKey string = "scwIpCache"
+	pnApiCacheKey      string = "scwPnIpCache"
 )
 
 type NodeNameID struct {
@@ -71,6 +75,7 @@ type NodeNameID struct {
 type Cache interface {
 	Set(cacheKey string, value interface{}, maxAge time.Duration)
 	Get(cacheKey string) (value interface{}, found bool)
+	Flush()
 }
 
 // ScwExternalIPReconciler reconciles a ScwExternalIP object
@@ -80,16 +85,24 @@ type ScwExternalIPReconciler struct {
 	ScwClient *scw.Client
 	Cache     Cache
 }
+type ScwIP struct {
+	ID               string
+	Address          net.IP
+	Prefix           scw.IPNet
+	Server           *instance.ServerSummary
+	Zone             scw.Zone
+	Region           scw.Region
+	PrivateNetworkId *string
+	MacAddr          *string
+}
 
-//+kubebuilder:rbac:groups=ptrk.io,resources=scwexternalips,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=ptrk.io,resources=scwexternalips/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=ptrk.io,resources=scwexternalips/finalizers,verbs=update
-//+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
-//+kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
-
+// +kubebuilder:rbac:groups=ptrk.io,resources=scwexternalips,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=ptrk.io,resources=scwexternalips/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=ptrk.io,resources=scwexternalips/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
-	api := instance.NewAPI(r.ScwClient)
 
 	var scweip ptrkiov1alpha1.ScwExternalIP
 	if err := r.Get(ctx, req.NamespacedName, &scweip); err != nil {
@@ -156,7 +169,7 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	ipMap, err := r.getInstanceIPMap()
+	ipMap, err := r.getInstanceIPMap(scweip)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -173,7 +186,6 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	for _, eip := range eIPs {
 		delete(oldAttached, eip)
-
 		sip, err := utils.GetV4OrV664Prefix(eip)
 		if err != nil {
 			log.Error(err, "unable to get v4v6 string from ip", "ip", eip)
@@ -201,11 +213,17 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 
 			// Sort the possibleNodes to make sure to spread IPs to all the nodes
-			sort.Slice(possibleNodes, func(i, j int) bool {
-				return len(possibleNodes[i].specs.PublicIPs) < len(possibleNodes[j].specs.PublicIPs)
-			})
+			if ip.PrivateNetworkId == nil {
+				sort.Slice(possibleNodes, func(i, j int) bool {
+					return len(possibleNodes[i].specs.PublicIPs) < len(possibleNodes[j].specs.PublicIPs)
+				})
+			} else {
+				sort.Slice(possibleNodes, func(i, j int) bool {
+					return len(possibleNodes[i].specs.PrivateNics) < len(possibleNodes[j].specs.PrivateNics)
+				})
+			}
 
-			var nodeName, nodeID, nodeMacAddr string
+			var nodeName, nodeID, nodeMacAddr, nodeZone string
 
 			if ip.Server != nil {
 				// IP already attached to a server
@@ -213,11 +231,21 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 					if nni.Name == ip.Server.Name {
 						nodeName = nni.Name
 						nodeID = nni.ID
+						nodeZone = nni.specs.Zone.String()
 						nodeMacAddr = nni.specs.MacAddress
+						if ip.PrivateNetworkId != nil {
+							for _, nic := range nni.specs.PrivateNics {
+								if nic.PrivateNetworkID == *ip.PrivateNetworkId {
+									nodeMacAddr = nic.MacAddress
+								}
+							}
+						}
 						break
 					}
 				}
+
 				if nodeName == "" {
+					log.V(2).Info("ip not attached to a possible node", "ip", ip.Address.String(), "server", ip.Server)
 					// IP not attached to a possible node
 					node := &corev1.Node{}
 					err := r.Get(ctx, types.NamespacedName{Name: ip.Server.Name}, node)
@@ -249,13 +277,7 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 							if c.Status != corev1.ConditionTrue {
 								// node attached to the IP is not ready, let's atttach the IP to another node
 								for i, s := range possibleNodes {
-									_, err := api.UpdateIP(&instance.UpdateIPRequest{
-										Zone: ip.Zone,
-										IP:   ip.ID,
-										Server: &instance.NullableStringValue{
-											Value: s.ID,
-										},
-									})
+									err := r.attachIP(ip, s)
 									if err != nil {
 										log.Error(err, "error attaching ip", "ip", ip.ID, "server", s.ID)
 										if i == len(possibleNodes)-1 {
@@ -269,23 +291,24 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 										}
 										continue
 									}
-									scweip.Status.IPs = append(scweip.Status.IPs, eip)
+									scweip.Status.IPs = append(scweip.Status.IPs, ip.Address.String())
 									scweip.Status.AttachedIPs = append(scweip.Status.AttachedIPs, ptrkiov1alpha1.ScwNodeExternalIP{
-										IP:          eip,
-										IPID:        ip.ID,
-										Zone:        ip.Zone.String(),
-										Node:        s.ID,
-										NodeID:      s.Name,
-										NodeMacAddr: s.specs.MacAddress,
+										IP:               ip.Address.String(),
+										IPID:             ip.ID,
+										Zone:             ip.Zone.String(),
+										Node:             s.Name,
+										NodeID:           s.ID,
+										NodeMacAddr:      *ip.MacAddr,
+										PrivateNetworkId: ip.PrivateNetworkId,
 									})
-									log.Info("Attached IP", "ip", eip, "nodeID", s.ID, "node", s.Name, "zone", ip.Zone.String(), "mac", s.specs.MacAddress)
+									log.Info("add ip to attached pool", "ip", eip, "nodeName", s.Name, "zone", ip.Zone.String(), "nodeMacAddr", *ip.MacAddr, "pnId", ip.PrivateNetworkId)
 									break
 								}
 							} else {
 								// node is ready, have the IP, but is not in possibleNodes, weird
 								scweip.Status.PendingIPsCount++
 								scweip.Status.PendingIPs = append(scweip.Status.PendingIPs, ptrkiov1alpha1.ScwExternalIPStatusPendingIP{
-									IP:     eip,
+									IP:     ip.Address.String(),
 									Zone:   ip.Zone.String(),
 									Reason: fmt.Sprintf("IP is already attached to a cluster node (%s), not matching conditions", node.Name),
 								})
@@ -294,31 +317,30 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 						}
 					}
 				} else {
-					scweip.Status.IPs = append(scweip.Status.IPs, eip)
+					log.V(2).Info("ip already attached to a node")
+					scweip.Status.IPs = append(scweip.Status.IPs, ip.Address.String())
+					log.Info("add ip to attached pool", "ip", ip, "nodeName", nodeName, "zone", nodeZone, "nodeMacAddr", nodeMacAddr, "pnId", ip.PrivateNetworkId)
 					scweip.Status.AttachedIPs = append(scweip.Status.AttachedIPs, ptrkiov1alpha1.ScwNodeExternalIP{
-						IP:          eip,
-						IPID:        ip.ID,
-						Zone:        ip.Zone.String(),
-						Node:        nodeName,
-						NodeID:      nodeID,
-						NodeMacAddr: nodeMacAddr,
+						IP:               ip.Address.String(),
+						IPID:             ip.ID,
+						Zone:             nodeZone,
+						Node:             nodeName,
+						NodeID:           nodeID,
+						NodeMacAddr:      nodeMacAddr,
+						PrivateNetworkId: ip.PrivateNetworkId,
 					})
 				}
 			} else {
 				// IP not attached to a server
+				log.V(2).Info("ip not attached to a server", "ip", ip.Address.String())
 				for i, s := range possibleNodes {
-					_, err = api.UpdateIP(&instance.UpdateIPRequest{
-						// TODO: add reverse ?
-						IP:     ip.ID,
-						Zone:   ip.Zone,
-						Server: &instance.NullableStringValue{Value: s.ID},
-					})
+					err := r.attachIP(ip, s)
 					if err != nil {
 						log.Error(err, "unable to update ip", "ip", ip.Address.String(), "server", s.ID, "zone", ip.Zone.String())
 						if i == len(possibleNodes)-1 {
 							scweip.Status.PendingIPsCount++
 							scweip.Status.PendingIPs = append(scweip.Status.PendingIPs, ptrkiov1alpha1.ScwExternalIPStatusPendingIP{
-								IP:     eip,
+								IP:     ip.Address.String(),
 								Zone:   ip.Zone.String(),
 								Reason: "No server could attached to IP",
 							})
@@ -326,16 +348,17 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 						}
 						continue
 					}
-					scweip.Status.IPs = append(scweip.Status.IPs, eip)
+					scweip.Status.IPs = append(scweip.Status.IPs, ip.Address.String())
 					scweip.Status.AttachedIPs = append(scweip.Status.AttachedIPs, ptrkiov1alpha1.ScwNodeExternalIP{
-						IP:          eip,
-						IPID:        ip.ID,
-						Zone:        ip.Zone.String(),
-						Node:        s.ID,
-						NodeID:      s.Name,
-						NodeMacAddr: s.specs.MacAddress,
+						IP:               ip.Address.String(),
+						IPID:             ip.ID,
+						Zone:             ip.Zone.String(),
+						Node:             s.Name,
+						NodeID:           s.ID,
+						NodeMacAddr:      *ip.MacAddr,
+						PrivateNetworkId: ip.PrivateNetworkId,
 					})
-					log.Info("Attached IP", "ip", eip, "nodeID", s.ID, "node", s.Name, "zone", ip.Zone.String(), "macAddr", s.specs.MacAddress)
+					log.Info("Attached IP", "ip", eip, "nodeID", s.ID, "node", s.Name, "zone", ip.Zone.String(), "macAddr", *ip.MacAddr)
 					break
 				}
 			}
@@ -365,29 +388,66 @@ func (r *ScwExternalIPReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return ctrl.Result{}, nil
 }
 
-func (r *ScwExternalIPReconciler) getInstanceIPMap() (map[string]*instance.IP, error) {
+// getInstanceIPMap return all public and pn ips available from compute API
+func (r *ScwExternalIPReconciler) getInstanceIPMap(scweip ptrkiov1alpha1.ScwExternalIP) (map[string]*ScwIP, error) {
+	ipMap := make(map[string]*ScwIP)
 
-	ipMap := make(map[string]*instance.IP)
-
-	resp, err := r.getCachedAPIResponse()
+	resp, err := r.getCachedPublicIps()
 	if err != nil {
 		return nil, fmt.Errorf("unable to list scw ips: %w", err)
 	}
 
 	for _, ip := range resp.IPs {
 		if ip.Type == instance.IPTypeRoutedIPv6 {
-			ipMap[ip.Prefix.String()] = ip
+			ipMap[ip.Prefix.String()] = &ScwIP{
+				ID:      ip.ID,
+				Address: ip.Address,
+				Prefix:  ip.Prefix,
+				Server:  ip.Server,
+				Zone:    ip.Zone,
+				Region:  scw.Region(ip.Zone),
+			}
 		} else if ip.Type == instance.IPTypeRoutedIPv4 {
-			ipMap[ip.Address.String()] = ip
+			ipMap[ip.Address.String()] = &ScwIP{
+				ID:      ip.ID,
+				Address: ip.Address,
+				Prefix:  ip.Prefix,
+				Server:  ip.Server,
+				Zone:    ip.Zone,
+				Region:  scw.Region(ip.Zone),
+			}
+		}
+	}
+
+	if scweip.Spec.PrivateNetwork != "" {
+		resp, err := r.getCachedPrivateIps(scweip.Spec.PrivateNetwork)
+		if err != nil {
+			return nil, fmt.Errorf("unable to list scw ips: %w", err)
+		}
+
+		for _, ip := range resp.IPs {
+			ipMap[ip.Address.IP.String()] = &ScwIP{
+				ID:               ip.ID,
+				Address:          ip.Address.IP,
+				Region:           ip.Region,
+				PrivateNetworkId: &scweip.Spec.PrivateNetwork,
+			}
+
+			if ip.Resource != nil {
+				ipMap[ip.Address.IP.String()].Server = &instance.ServerSummary{
+					ID:   ip.Resource.ID,
+					Name: *ip.Resource.Name,
+				}
+			}
 		}
 	}
 
 	return ipMap, nil
 }
 
-// getCachedAPIResponse returns the cached API response if available, otherwise it fetches from the API.
-func (r *ScwExternalIPReconciler) getCachedAPIResponse() (*instance.ListIPsResponse, error) {
-	if cachedResponse, found := r.Cache.Get(cacheKey); found {
+// getCachedPublicIps returns the cached API response if available, otherwise it fetches from the API.
+func (r *ScwExternalIPReconciler) getCachedPublicIps() (*instance.ListIPsResponse, error) {
+	if cachedResponse, found := r.Cache.Get(computeApiCacheKey); found {
 		return cachedResponse.(*instance.ListIPsResponse), nil
 	}
 
@@ -398,8 +458,101 @@ func (r *ScwExternalIPReconciler) getCachedAPIResponse() (*instance.ListIPsRespo
 		return nil, err
 	}
 
-	r.Cache.Set(cacheKey, res, cache.DefaultExpiration)
+	r.Cache.Set(computeApiCacheKey, res, cache.DefaultExpiration)
 	return res, nil
+}
+
+// getCachedPrivateIps returns the cached IPAM API response if available, otherwise it fetches from the API.
+func (r *ScwExternalIPReconciler) getCachedPrivateIps(pnId string) (*ipam.ListIPsResponse, error) {
+	if cachedResponse, found := r.Cache.Get(pnApiCacheKey); found {
+		return cachedResponse.(*ipam.ListIPsResponse), nil
+	}
+
+	api := ipam.NewAPI(r.ScwClient)
+	res, err := api.ListIPs(&ipam.ListIPsRequest{PrivateNetworkID: &pnId}, scw.WithAllPages())
+	if err != nil {
+		return nil, err
+	}
+
+	r.Cache.Set(pnApiCacheKey, res, cache.DefaultExpiration)
+	return res, nil
+}
+
+func (r *ScwExternalIPReconciler) attachIP(ip *ScwIP, node NodeNameID) error {
+	api := instance.NewAPI(r.ScwClient)
+	if ip.PrivateNetworkId == nil {
+		_, err := api.UpdateIP(&instance.UpdateIPRequest{
+			Zone: node.specs.Zone,
+			IP:   ip.ID,
+			Server: &instance.NullableStringValue{
+				Value: node.ID,
+			},
+		})
+		if err != nil {
+			return err
+		}
+		ip.MacAddr = &node.specs.MacAddress
+	} else {
+		nic, err := api.CreatePrivateNIC(&instance.CreatePrivateNICRequest{
+			Zone:             node.specs.Zone,
+			ServerID:         node.ID,
+			PrivateNetworkID: *ip.PrivateNetworkId,
+			IpamIPIDs:        []string{ip.ID},
+		})
+		if err != nil {
+			return err
+		}
+		ip.MacAddr = &nic.PrivateNic.MacAddress
+		ip.Zone = node.specs.Zone
+		// TODO wait for NIC to be available
+		time.Sleep(10 * time.Second)
+	}
+	// clear API cache
+	r.Cache.Flush()
+	return nil
+}
+
+func (r *ScwExternalIPReconciler) detachIP(ip ptrkiov1alpha1.ScwNodeExternalIP) error {
+	api := instance.NewAPI(r.ScwClient)
+
+	if ip.PrivateNetworkId == nil {
+		resp, err := api.GetIP(&instance.GetIPRequest{
+			Zone: scw.Zone(ip.Zone),
+			IP:   ip.IPID,
+		})
+		if err != nil {
+			notFoundError := &scw.ResourceNotFoundError{}
+			responseError := &scw.ResponseError{}
+			if errors.As(err, &responseError) && responseError.StatusCode == http.StatusNotFound || errors.As(err, &notFoundError) {
+				return nil
+			}
+			return err
+		}
+		if resp.IP.Server != nil && resp.IP.Server.Name == ip.Node {
+			_, err = api.UpdateIP(&instance.UpdateIPRequest{
+				Zone:   scw.Zone(ip.Zone),
+				IP:     ip.IPID,
+				Server: &instance.NullableStringValue{Null: true},
+			})
+			return err
+		}
+	} else {
+		resp, err := api.GetServer(&instance.GetServerRequest{Zone: scw.Zone(ip.Zone), ServerID: ip.NodeID})
+		if err != nil {
+			notFoundError := &scw.ResourceNotFoundError{}
+			responseError := &scw.ResponseError{}
+			if errors.As(err, &responseError) && responseError.StatusCode == http.StatusNotFound || errors.As(err, &notFoundError) {
+				return nil
+			}
+			return err
+		}
+		for _, nic := range resp.Server.PrivateNics {
+			if nic.MacAddress == ip.NodeMacAddr {
+				return api.DeletePrivateNIC(&instance.DeletePrivateNICRequest{Zone: scw.Zone(ip.Zone), ServerID: resp.Server.ID, PrivateNicID: nic.ID})
+			}
+		}
+	}
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -545,7 +698,10 @@ func (r *ScwExternalIPReconciler) findNodes(ctx context.Context, zone string, no
 	if len(nodeSelector) == 0 {
 		nodeSelector = make(map[string]string)
 	}
-	nodeSelector[corev1.LabelTopologyZone] = zone
+	// PN IPs are regional so no need to filter on this
+	if zone != "" {
+		nodeSelector[corev1.LabelTopologyZone] = zone
+	}
 
 	var nodes corev1.NodeList
 	if err := r.List(ctx, &nodes, &client.ListOptions{
@@ -568,13 +724,15 @@ func (r *ScwExternalIPReconciler) findNodes(ctx context.Context, zone string, no
 	}
 
 	var nodeNamesIDs []NodeNameID
-
 	if len(nodeNames) > 0 {
 		api := instance.NewAPI(r.ScwClient)
-		resp, err := api.ListServers(&instance.ListServersRequest{
-			Zone: scw.Zone(zone),
+		req := instance.ListServersRequest{
 			Name: scw.StringPtr(utils.CommonPrefix(nodeNames)),
-		})
+		}
+		if zone != "" {
+			req.Zone = scw.Zone(zone)
+		}
+		resp, err := api.ListServers(&req)
 		if err != nil {
 			return nil, fmt.Errorf("unable to list scw servers: %w", err)
 		}
@@ -592,33 +750,12 @@ func (r *ScwExternalIPReconciler) findNodes(ctx context.Context, zone string, no
 func (r *ScwExternalIPReconciler) cleanup(ctx context.Context, attached []ptrkiov1alpha1.ScwNodeExternalIP) error {
 	log := log.FromContext(ctx)
 	errs := []string{}
-	api := instance.NewAPI(r.ScwClient)
 	for _, ip := range attached {
-		resp, err := api.GetIP(&instance.GetIPRequest{
-			Zone: scw.Zone(ip.Zone),
-			IP:   ip.IPID,
-		})
-		if err != nil {
-			notFoundError := &scw.ResourceNotFoundError{}
-			responseError := &scw.ResponseError{}
-			if errors.As(err, &responseError) && responseError.StatusCode == http.StatusNotFound || errors.As(err, &notFoundError) {
-				continue
-			}
-			errs = append(errs, fmt.Sprintf("error getting ip %s in %s: %s", ip.IPID, ip.Zone, err.Error()))
-			continue
+
+		if err := r.detachIP(ip); err != nil {
+			errs = append(errs, fmt.Sprint(err))
 		}
-		if resp.IP.Server != nil && resp.IP.Server.Name == ip.Node {
-			_, err = api.UpdateIP(&instance.UpdateIPRequest{
-				Zone:   scw.Zone(ip.Zone),
-				IP:     ip.IPID,
-				Server: &instance.NullableStringValue{Null: true},
-			})
-			if err != nil {
-				errs = append(errs, err.Error())
-				continue
-			}
-			log.Info("Detached IP", "ip", ip.IPID, "zone", ip.Zone, "macAddr", ip.NodeMacAddr)
-		}
+		log.Info("Detached IP", "ip", ip.IPID, "zone", ip.Zone, "macAddr", ip.NodeMacAddr)
 	}
 
 	if len(errs) == 0 {
